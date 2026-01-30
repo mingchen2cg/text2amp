@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Dict, Any
 
+# === [新增 Import] 用于清理 MoE 缓存 ===
+import megablocks.layers.moe 
+
 # 引入基础组件
 from transformers import T5EncoderModel, T5Config
 from models.progen3_module.modeling import ProGen3ForCausalLM, RMSNorm
@@ -36,6 +39,9 @@ class CrossAttentionBlock(nn.Module):
 
         key_padding_mask = None
         if encoder_attention_mask is not None:
+            # MultiheadAttention 的 key_padding_mask: True 表示被遮蔽(ignore)，False 表示保留
+            # T5 tokenizer通常 0 是 padding, 1 是 mask
+            # 这里需确保转换逻辑正确，通常 transformer 输出的 mask 1是有效，0是padding
             key_padding_mask = (encoder_attention_mask == 0).bool()
 
         attn_output, _ = self.attn(
@@ -48,21 +54,22 @@ class CrossAttentionBlock(nn.Module):
 
 class ProGen3LayerWithCrossAttn(nn.Module):
     """
-    这是一个"完全体"的层定义。
-    我们不再动态劫持，而是直接定义它包含：Original Layer + Cross Attn
+    包含 Original ProGen3 Layer + Cross Attention 的复合层
     """
     def __init__(self, original_layer, t5_hidden_dim):
         super().__init__()
-        self.original_layer = original_layer # 这是一个 ProGen3Block
+        self.original_layer = original_layer 
         
-        # 动态获取参数
+        # 动态获取 hidden_size 和 num_heads
         hidden_size = original_layer.hidden_size
+        
+        # 兼容 ProGen3 不同的 Attention 定义 (Fused 或 Unfused)
         if hasattr(original_layer, "self_attn"):
             num_heads = original_layer.self_attn.num_heads
         elif hasattr(original_layer, "norm_attn_norm"):
             num_heads = original_layer.norm_attn_norm.self_attn.num_heads
         else:
-            # Fallback for config
+            # Fallback
             num_heads = original_layer.num_heads 
         
         self.cross_attn = CrossAttentionBlock(
@@ -74,15 +81,15 @@ class ProGen3LayerWithCrossAttn(nn.Module):
     def forward(self, hidden_states, position_ids, encoder_hidden_states, encoder_attention_mask, 
                 past_key_value=None, output_attentions=False, output_router_weights=False, use_cache=False):
         
-        # 1. ProGen3 Self-Attention
+        # 1. ProGen3 Self-Attention (包含 Norm)
         if hasattr(self.original_layer, "norm_attn_norm"):
-            # Fused
+            # Fused Attention Norm
             hidden_states, residual, self_attn_weights, present_key_value = self.original_layer.norm_attn_norm(
                 hidden_states=hidden_states, position_ids=position_ids, past_key_value=past_key_value,
                 output_attentions=output_attentions, use_cache=use_cache
             )
         else:
-            # Unfused
+            # Standard Attention
             residual = hidden_states
             hidden_states = self.original_layer.input_layernorm(hidden_states)
             hidden_states, self_attn_weights, present_key_value = self.original_layer.self_attn(
@@ -91,19 +98,21 @@ class ProGen3LayerWithCrossAttn(nn.Module):
             )
             hidden_states = residual + hidden_states
 
-        # 2. Cross-Attention
+        # 2. Cross-Attention (注入文本信息)
         hidden_states = self.cross_attn(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask
         )
 
-        # 3. ProGen3 FFN
+        # 3. ProGen3 FFN / MoE
         residual = hidden_states
         if hasattr(self.original_layer, "post_attention_layernorm"):
             hidden_states = self.original_layer.post_attention_layernorm(hidden_states)
         
         block_sparse_moe = self.original_layer.block_sparse_moe
+        
+        # 处理不同的 MoE 返回格式
         if self.original_layer.moe_implementation == "megablocks":
              hidden_states = block_sparse_moe(hidden_states)
              router_weights = None 
@@ -119,7 +128,7 @@ class ProGen3LayerWithCrossAttn(nn.Module):
         return outputs
 
 # ================================================================= #
-#                      主模型类 (最终成品)                           #
+#                      主模型类 (最终修复版)                         #
 # ================================================================= #
 
 class Text2ProteinGenModel(ABSmodule):
@@ -130,24 +139,34 @@ class Text2ProteinGenModel(ABSmodule):
         # 1. 加载 Checkpoint
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         config_dict = checkpoint["config"]
+        progen_conf = config_dict["progen_config"]
+
+        # === [Critical Fix 1] 兼容参数冻结 ===
+        # 强制关闭 MegaBlocks 的内存优化，防止反向传播时报错 "Expected all MLP inputs to need grad"
+        if hasattr(progen_conf, "moe_memory_optimized"):
+            print("Config: Disabling moe_memory_optimized for training stability...")
+            progen_conf.moe_memory_optimized = False
+        if hasattr(progen_conf, "moe_grouped_gemm"):
+            print("Config: Disabling moe_grouped_gemm for training stability...")
+            progen_conf.moe_grouped_gemm = False
+
+        # === [Critical Fix 2] 显存优化 ===
+        # 训练时强制关闭 use_cache，防止缓存大量历史状态
+        progen_conf.use_cache = False 
         
-        # 2. 从配置恢复结构 (Init from Config, NOT from pretrained path)
+        # 2. 从配置恢复结构
         print("Building model architecture...")
         
         # A. 构建 T5 Encoder
         self.lm = T5EncoderModel(config_dict["t5_config"])
         
-        # B. 构建 ProGen3 Decoder (带 CrossAttn)
-        # 这里我们先构建原始的 ProGen3 结构
-        temp_progen = ProGen3ForCausalLM(config_dict["progen_config"])
+        # B. 构建 ProGen3 Decoder
+        temp_progen = ProGen3ForCausalLM(progen_conf)
         
-        # C. 替换层结构 (Architecture Reconstruction)
-        # 这一步是必须的，因为保存的 state_dict 里包含 cross_attn 权重，
-        # 如果模型结构里没有这个层，加载权重会报错。
+        # C. 插入 Cross Attention 层
         self.lm_dim = config_dict["lm_dim"]
         new_layers = nn.ModuleList()
         for layer in temp_progen.model.layers:
-            # 包装成带 CrossAttn 的层
             new_layers.append(ProGen3LayerWithCrossAttn(layer, self.lm_dim))
         
         temp_progen.model.layers = new_layers
@@ -157,10 +176,7 @@ class Text2ProteinGenModel(ABSmodule):
         print("Loading state dictionary...")
         state_dict = checkpoint["state_dict"]
         
-        # 处理 key 名称 (因为之前的包装器层级差异)
-        # 如果你之前的 T5 是用 T5Encoder 包装的，key 可能是 'lm.lm.xxx'
-        # 如果是原生 T5EncoderModel，key 是 'lm.xxx'
-        # 这里做一个简单的清洗以防万一
+        # 清洗 Key 名称
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith("lm.lm."):
@@ -169,25 +185,33 @@ class Text2ProteinGenModel(ABSmodule):
             else:
                 new_state_dict[k] = v
                 
-        # 加载所有参数 (strict=True 保证结构完美匹配)
+        # 加载所有参数
         self.load_state_dict(new_state_dict, strict=True)
         
-        # 4. 设置设备兼容性 (Flash Attention 需要 BF16/FP16)
+        # 4. 设置设备兼容性
         target_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
         self.plm.to(target_dtype)
         
         print("Model restored successfully!")
 
     def infer_text(self, batch):
-        outputs = self.lm(
-            input_ids=batch["text_ids"],
-            attention_mask=batch["text_masks"],
-            return_dict=True
-        )
+        # === [Critical Fix 3] 节省显存 ===
+        # T5 只做特征提取，强制 no_grad，避免存储激活值
+        with torch.no_grad():
+            outputs = self.lm(
+                input_ids=batch["text_ids"],
+                attention_mask=batch["text_masks"],
+                return_dict=True
+            )
         return outputs.last_hidden_state, batch["text_masks"]
 
     def infer(self, batch, text_hidden_states=None, text_attention_mask=None):
-        input_ids = batch["protein_ids"] # 使用修正后的字段名
+        # === [Critical Fix 4] 修复显存泄漏 ===
+        # 必须手动清理 MegaBlocks 累积的 load balancing loss
+        if hasattr(self.plm.config, "moe_implementation") and self.plm.config.moe_implementation == "megablocks":
+             megablocks.layers.moe.clear_load_balancing_loss()
+
+        input_ids = batch["protein_ids"]
         labels = batch.get("labels", input_ids)
         
         # 数据类型对齐
@@ -205,10 +229,12 @@ class Text2ProteinGenModel(ABSmodule):
 
         # Forward Layers
         for layer in self.plm.model.layers:
+            # 显式传递 use_cache=False
             layer_out = layer(
                 hidden_states, position_ids=position_ids,
                 encoder_hidden_states=text_hidden_states,
-                encoder_attention_mask=text_attention_mask
+                encoder_attention_mask=text_attention_mask,
+                use_cache=False 
             )
             hidden_states = layer_out[0]
 
